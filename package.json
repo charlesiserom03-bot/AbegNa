@@ -1,0 +1,10 @@
+{
+  "name": "abegna",
+  "version": "1.0.0",
+  "description": "Abegna: Nigerians post needs, sponsors swipe to fund them.",
+  "main": "server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": { "start": "node server.js", "seed": "SEED=1 node server.js", "test": "node test.js" },
+  "license": "UNLICENSED",
+  "private": true
+}
