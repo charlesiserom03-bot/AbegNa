@@ -12,7 +12,7 @@ const PORT = +process.env.PORT || 3000;
 const PROD = process.env.NODE_ENV === 'production';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'abegna.db');
-const MIN_AMT = 2000, MAX_AMT = 100000, WAIT_MS = 14 * 864e5, SESSION_MS = 30 * 864e5;
+const MIN_AMT = 2000, MAX_AMT = 100000, WAIT_MS = 14 * 864e5, SESSION_MS = 30 * 864e5, REAIR_MS = 5 * 864e5, MAX_REAIRS = 3;
 
 /* ---------- database ---------- */
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS needs(
   id INTEGER PRIMARY KEY, owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL, name TEXT NOT NULL,
   loc TEXT NOT NULL, cat TEXT NOT NULL, amt INTEGER NOT NULL CHECK(amt BETWEEN ${MIN_AMT} AND ${MAX_AMT}),
   why TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK(status IN('open','funded')),
-  paid_by INTEGER REFERENCES users(id), paid_at INTEGER, created_at INTEGER NOT NULL);
+  paid_by INTEGER REFERENCES users(id), paid_at INTEGER, created_at INTEGER NOT NULL,
+  aired_at INTEGER NOT NULL DEFAULT 0, reairs INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS skips(user_id INTEGER NOT NULL, need_id INTEGER NOT NULL, PRIMARY KEY(user_id,need_id));
 CREATE TABLE IF NOT EXISTS payments(
   id INTEGER PRIMARY KEY, need_id INTEGER NOT NULL REFERENCES needs(id), sponsor_id INTEGER NOT NULL REFERENCES users(id),
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS payments(
 CREATE INDEX IF NOT EXISTS idx_needs_status ON needs(status,created_at);
 CREATE INDEX IF NOT EXISTS idx_needs_owner ON needs(owner_id);
 `);
+for (const c of ['aired_at INTEGER NOT NULL DEFAULT 0', 'reairs INTEGER NOT NULL DEFAULT 0']) { try { db.exec('ALTER TABLE needs ADD COLUMN ' + c); } catch { /* already exists */ } }
+db.exec('UPDATE needs SET aired_at=created_at WHERE aired_at=0');
 const q = {
   userByPhone: db.prepare('SELECT * FROM users WHERE phone=?'),
   userById: db.prepare('SELECT id,role,name,phone,last_post_at FROM users WHERE id=?'),
@@ -145,7 +148,8 @@ route('GET', '/api/me', (req, res) => { const u = session(req); json(res, 200, {
 
 route('GET', '/api/feed', (req, res) => {
   const u = need(req, 'sponsor');
-  json(res, 200, { needs: db.prepare(`SELECT id,name,loc,cat,amt,why FROM needs WHERE status='open' AND id NOT IN (SELECT need_id FROM skips WHERE user_id=?) ORDER BY created_at LIMIT 20`).all(u.id) });
+  const st = db.prepare('SELECT COUNT(*) c, COALESCE(SUM(amt),0) s FROM needs WHERE paid_by=?').get(u.id);
+  json(res, 200, { stats: { count: st.c, total: st.s }, needs: db.prepare(`SELECT id,name,loc,cat,amt,why FROM needs WHERE status='open' AND id NOT IN (SELECT need_id FROM skips WHERE user_id=?) ORDER BY aired_at DESC LIMIT 20`).all(u.id) });
 });
 route('POST', '/api/needs/:id/skip', (req, res, m) => {
   const u = need(req, 'sponsor'); db.prepare('INSERT OR IGNORE INTO skips VALUES(?,?)').run(u.id, +m[1]); json(res, 200, { ok: true });
@@ -179,7 +183,7 @@ route('POST', '/api/needs', async (req, res) => {
   const out = tx(() => {
     const last = q.userById.get(u.id).last_post_at, now = Date.now();
     if (now - last < WAIT_MS) throw Object.assign(new HttpError(429, 'You can only post one request every 2 weeks.'), { next: last + WAIT_MS });
-    const r = db.prepare('INSERT INTO needs(owner_id,name,loc,cat,amt,why,created_at) VALUES(?,?,?,?,?,?,?)').run(u.id, u.name, loc, b.cat, amt, why, now);
+    const r = db.prepare('INSERT INTO needs(owner_id,name,loc,cat,amt,why,created_at,aired_at) VALUES(?,?,?,?,?,?,?,?)').run(u.id, u.name, loc, b.cat, amt, why, now, now);
     db.prepare('UPDATE users SET last_post_at=? WHERE id=?').run(now, u.id);
     return { id: Number(r.lastInsertRowid), next_post_at: now + WAIT_MS };
   });
@@ -187,20 +191,32 @@ route('POST', '/api/needs', async (req, res) => {
 });
 route('GET', '/api/needs/mine', (req, res) => {
   const u = need(req, 'requester');
-  json(res, 200, { needs: db.prepare('SELECT id,loc,cat,amt,status,created_at,paid_at FROM needs WHERE owner_id=? ORDER BY created_at DESC').all(u.id), user: pubUser(q.userById.get(u.id)) });
+  json(res, 200, { needs: db.prepare('SELECT id,loc,cat,amt,status,created_at,paid_at,aired_at,reairs FROM needs WHERE owner_id=? ORDER BY created_at DESC').all(u.id), user: pubUser(q.userById.get(u.id)) });
+});
+
+route('POST', '/api/needs/:id/reair', (req, res, m) => {
+  const u = need(req, 'requester'), n = db.prepare('SELECT * FROM needs WHERE id=? AND owner_id=?').get(+m[1], u.id);
+  if (!n) bad(404, 'Request not found.');
+  if (n.status !== 'open') bad(409, 'This request has already been funded.');
+  if (n.reairs >= MAX_REAIRS) bad(429, 'You have used all re-airs for this request.');
+  const now = Date.now();
+  if (now - n.aired_at < REAIR_MS) bad(429, 'You can re-air a request after 5 days without a response.');
+  tx(() => { db.prepare('UPDATE needs SET aired_at=?,reairs=reairs+1 WHERE id=?').run(now, n.id); db.prepare('DELETE FROM skips WHERE need_id=?').run(n.id); });
+  json(res, 200, { ok: true, aired_at: now });
 });
 
 /* ---------- static files + server ---------- */
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 const SEC = {
   'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY',
   ...(PROD ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {}),
 };
-const FILES = new Set(['index.html', 'style.css', 'app.js']); // only these are public
+const FILES = new Set(['index.html', 'style.css', 'app.js', 'hero.svg', 'hero.jpg']); // only these are public
 function serveStatic(req, res, pathname) {
   const name = pathname.replace(/^\//, '');
-  const f = path.join(__dirname, FILES.has(name) ? name : 'index.html');
+  let f = path.join(__dirname, FILES.has(name) ? name : 'index.html');
+  if (!fs.existsSync(f)) { if (name === 'hero.jpg') { res.writeHead(404); return res.end(); } f = path.join(__dirname, 'index.html'); }
   const ext = path.extname(f);
   res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600' });
   fs.createReadStream(f).pipe(res);
@@ -237,6 +253,7 @@ if (process.env.SEED === '1' && !db.prepare('SELECT 1 FROM needs LIMIT 1').get()
    ['Emeka Nwosu', 'Aba, Abia', 'Rent', 20000, 'I lost my job last month and my landlord has given me a week to pay part of my rent.'],
    ['Blessing Udo', 'Uyo, Akwa Ibom', 'School fees', 12000, 'I am a single mother. My son’s school fees for this term are due and he has been sent home.']]
     .forEach(r => ins.run(...r, t++));
+  db.exec('UPDATE needs SET aired_at=created_at WHERE aired_at=0');
   console.log('Seeded demo requests.');
 }
 if (require.main === module) server.listen(PORT, () => console.log(`Abegna running on http://localhost:${PORT}`));
